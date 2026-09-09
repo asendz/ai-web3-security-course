@@ -1,0 +1,69 @@
+{
+  "_meta": {
+    "note": "Real, unedited output of lucid.agent.find_bugs over the SecondSwap target, captured after the prompt revision (Medium+ only, no self-filtering for importance). Not cherry-picked - saved as returned.",
+    "target": "target/src",
+    "codebase_chars": 93576,
+    "agent": "lucid.agent.find_bugs (single call)",
+    "model": "openai/gpt-5.6-luna",
+    "temperature": 0.3,
+    "reasoning_effort": "high"
+  },
+  "findings": [
+    {
+      "title": "Vesting transfers can over-release tokens from the grantor",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:229-230",
+      "description": "When transferring vesting after tokens have already been claimed, the grantor's release rate is recalculated as `grantorVesting.totalAmount / numOfSteps`. This uses the full vesting schedule rather than the grantor's remaining amount divided by its remaining steps. The correct rate must account for `amountClaimed` and `stepsClaimed`.",
+      "impact": "A grantor can claim more than its post-transfer allocation, draining tokens backing the recipient's vesting. Subsequent recipient claims can revert or become underfunded, permanently locking or stealing part of the recipient's tokens.",
+      "exploit_steps": [
+        "Create a 10-step vesting schedule with 100 tokens for Alice and fund the vesting contract.",
+        "After five steps, Alice claims 50 tokens.",
+        "Alice lists and transfers 20 tokens through the marketplace; the default 20% sell limit permits this.",
+        "The transfer changes Alice's total allocation to 80 and leaves `amountClaimed` at 50, but sets `releaseRate` to `80 / 10 = 8` instead of `30 / 5 = 6`.",
+        "At steps six through nine, Alice claims 8 tokens per step for a total of 32 tokens, although only 30 tokens remain available to her.",
+        "The extra 2 tokens come from the vesting balance backing the buyer's 20-token allocation, causing the buyer's later claim to be underfunded or revert."
+      ]
+    },
+    {
+      "title": "Zero step duration permanently disables claims",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:133 and SecondSwap_VestingDeployer.sol:104-117",
+      "description": "The vesting constructor computes `stepDuration = (_endTime - _startTime) / _numOfSteps`, while the deployer only checks that `startTime < endTime` and `steps > 0`. It does not require the vesting duration to be at least the number of steps. Consequently, a schedule whose duration is shorter than its step count has `stepDuration == 0`, and `claimable()` later divides by zero at `elapsedTime / stepDuration`.",
+      "impact": "All allocations in the affected vesting contract are unclaimable through `claim()`, including after the vesting end time, permanently locking the underlying tokens for beneficiaries.",
+      "exploit_steps": [
+        "A token owner calls `deployVesting` with `startTime = 1000`, `endTime = 1001`, and `steps = 2`.",
+        "The deployer accepts the parameters and deploys a vesting contract with `stepDuration == 0`.",
+        "Create a vesting allocation for a beneficiary in that contract.",
+        "After the start time or after the end time, the beneficiary calls `claim()`.",
+        "The call reverts in `claimable()` when evaluating `elapsedTime / stepDuration`, so the beneficiary can never claim."
+      ]
+    },
+    {
+      "title": "Vesting schedules release fully before the configured end time",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:133 and 167-180",
+      "description": "The step duration is rounded down with integer division: `(_endTime - _startTime) / _numOfSteps`. At `endTime`, `currentStep` is therefore potentially greater than `numOfSteps`, and it reaches `numOfSteps` before `endTime` whenever the duration is not exactly divisible by the number of steps. The final-vesting branch then releases the entire remaining allocation.",
+      "impact": "All remaining tokens can be claimed early, before the configured vesting end time. For schedules with many steps, the early-release period can be substantial and breaks the vesting timetable relied on by sellers and buyers.",
+      "exploit_steps": [
+        "Deploy a schedule with `startTime = 1000`, `endTime = 1101`, and `numOfSteps = 10`.",
+        "The contract sets `stepDuration` to `101 / 10 = 10` seconds.",
+        "At timestamp 1100, which is one second before `endTime`, `currentStep` is 10.",
+        "A beneficiary calls `claim()` at timestamp 1100.",
+        "The condition `vesting.stepsClaimed + claimableSteps >= numOfSteps` is satisfied and the contract releases the entire remaining allocation before `endTime`."
+      ]
+    },
+    {
+      "title": "Referral rewards are calculated but never paid",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:478-492",
+      "description": "When a referral is supplied, `_handleTransfers` computes `referralFeeCost`, but neither `_referral` nor `referralFeeCollector` receives any transfer. The subsequent transfer sends the full `buyerFeeTotal + sellerFeeTotal` to `feeCollector`. Additionally, the reported value is calculated as the complement of the configured referral percentage rather than the configured percentage itself.",
+      "impact": "Referrers receive no referral rewards, while the fee collector retains the amount intended for referrals. The `Purchased` event reports a referral reward that was not transferred and is inconsistent with the configured referral allocation.",
+      "exploit_steps": [
+        "Configure a nonzero buyer fee and the default 10% referral percentage.",
+        "Create a public listing and have a buyer call `spotPurchase` with a nonzero `_referral` address.",
+        "Observe that `referralFeeCost` is calculated but no transfer is made to the referral address or referral fee collector.",
+        "Observe that the full buyer and seller fees are transferred to `feeCollector`, while the `Purchased` event reports a referral reward amount."
+      ]
+    }
+  ]
+}

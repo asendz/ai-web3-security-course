@@ -1,0 +1,82 @@
+{
+  "_meta": {
+    "note": "Real, unedited output of lucid.agent.find_bugs over the SecondSwap target, captured after the prompt revision (Medium+ only, no self-filtering for importance). Not cherry-picked - saved as returned.",
+    "target": "target/src",
+    "codebase_chars": 93576,
+    "agent": "lucid.agent.find_bugs (single call)",
+    "model": "openai/gpt-5.6-luna",
+    "temperature": 0.3,
+    "reasoning_effort": "high"
+  },
+  "findings": [
+    {
+      "title": "Vesting transfers allow beneficiaries to claim tokens after selling their entire unclaimed allocation",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:216-230",
+      "description": "When transferring vesting, the grantor's totalAmount is reduced but amountClaimed is unchanged, and releaseRate is reset to grantorVesting.totalAmount / numOfSteps rather than the remaining unclaimed amount divided by the remaining steps. A beneficiary who has already claimed tokens can therefore transfer all remaining tokens while retaining a nonzero releaseRate. claimable() does not cap non-final claims at totalAmount - amountClaimed.",
+      "impact": "A buyer can claim part of a purchased vesting allocation, list and sell all remaining tokens, and then continue claiming additional tokens that are not backed by their allocation. These extra claims drain the vesting contract's underlying token balance and can cause losses for other vesting holders.",
+      "exploit_steps": [
+        "Obtain a vesting allocation of 1000 tokens with 10 steps through a marketplace purchase.",
+        "After two steps, claim 200 tokens, leaving totalAmount equal to 1000 and amountClaimed equal to 200.",
+        "List and sell the remaining 800 tokens. transferVesting() reduces totalAmount to 200 but leaves amountClaimed at 200, then sets releaseRate to 200 / 10 = 20.",
+        "At the next step, call claim(). claimable() returns 20 even though amountClaimed already equals totalAmount.",
+        "Repeat at subsequent steps to claim up to 160 additional tokens that are not part of the remaining allocation."
+      ]
+    },
+    {
+      "title": "Non-divisible vesting durations release all tokens before endTime and over-advance claimed steps",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:133 and 167-185",
+      "description": "stepDuration is calculated using integer division: (_endTime - _startTime) / _numOfSteps. claimable() then derives currentStep using elapsedTime / stepDuration without capping currentStep to numOfSteps. If the duration is not evenly divisible by the number of steps, numOfSteps steps can complete before endTime, and at endTime currentStep can exceed numOfSteps.",
+      "impact": "All vesting tokens can become claimable before the configured endTime. After claiming, stepsClaimed can exceed numOfSteps; subsequent vesting creation or transfers to the same beneficiary can revert because _createVesting() subtracts the oversized stepsClaimed from numOfSteps, permanently preventing further allocations for that address.",
+      "exploit_steps": [
+        "Deploy a schedule with startTime 0, endTime 100, and numOfSteps 40. stepDuration becomes 2 seconds.",
+        "At timestamp 80, which is 20 seconds before endTime, call claim(). currentStep is already 40, so claimable() takes the completion branch and releases the entire remaining allocation.",
+        "At timestamp 100, currentStep is 50. If the beneficiary claims at this point, stepsClaimed is increased by 50 rather than being capped at 40.",
+        "Attempt to create or transfer another vesting allocation to that beneficiary. _createVesting() evaluates numOfSteps - stepsClaimed and reverts due to underflow."
+      ]
+    },
+    {
+      "title": "Referral rewards are calculated but never transferred",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:478-492",
+      "description": "_handleTransfers() calculates referralFeeCost, but no transfer is made to _referral or referralFeeCollector. The subsequent feeCollector transfer sends the full buyerFeeTotal plus sellerFeeTotal to the fee collector. The Purchased event also emits the retained fee amount as referralReward rather than paying the referral.",
+      "impact": "Referrers receive no referral reward despite buyers being charged the referral-enabled buyer fee. The fee collector retains the amount intended for the referral, and the emitted accounting event is incorrect.",
+      "exploit_steps": [
+        "Configure a nonzero referralFee in the marketplace settings.",
+        "Create a non-private listing and have a buyer call spotPurchase() with a distinct nonzero _referral address.",
+        "_handleTransfers() deducts the buyer fee from the buyer and computes referralFeeCost.",
+        "Observe that the only outgoing payment transfers go to the seller and feeCollector; no transfer is made to the referral address or referral fee collector.",
+        "The Purchased event reports referralFeeCost even though that amount was not paid to the referral."
+      ]
+    },
+    {
+      "title": "A valid 100% discount creates an unpurchasable listing and excessive discounts can underflow",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:252-260 and 413-421",
+      "description": "listVesting() does not enforce discountPct <= BASE. More importantly, discountPct == BASE is accepted, but _getDiscountedPrice() then returns zero for a full-amount purchase. _handleTransfers() rejects the resulting zero baseAmount. Values above BASE cause BASE - discountPct to underflow for fixed discounts, and can underflow for linear discounts once the effective discount exceeds BASE.",
+      "impact": "A SINGLE listing with the documented maximum discount of 10000 cannot be purchased at all after its vesting allocation has been escrowed. Excessive discounts can similarly create listings whose purchases always revert. The seller must unlist the escrowed allocation and may incur the early-unlisting penalty.",
+      "exploit_steps": [
+        "Call listVesting() with ListingType.SINGLE, DiscountType.FIX, and discountPct = 10000.",
+        "The listing succeeds and the vesting amount is transferred into marketplace custody through the vesting manager.",
+        "Attempt to purchase the required full listing amount.",
+        "_getDiscountedPrice() returns zero, _handleTransfers() computes baseAmount as zero, and the transaction reverts at the baseAmount > 0 check.",
+        "Alternatively, create a fixed-discount listing with discountPct greater than 10000; every purchase reverts during BASE - discountPct due to arithmetic underflow."
+      ]
+    },
+    {
+      "title": "Fee-on-transfer payment tokens can make purchases undercollateralized or permanently revert",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:205-218 and 476-492",
+      "description": "The marketplace allows an administrator to mark arbitrary token addresses as supported and assumes that safeTransferFrom() transfers exactly the requested amount. It does not measure the marketplace's balance increase before paying the seller and fee collector the nominal amount.",
+      "impact": "With a fee-on-transfer or tax token, the marketplace receives less than baseAmount + buyerFeeTotal but attempts to transfer the full nominal amount onward. Purchases can permanently revert for that currency, locking listings from sale; if the marketplace has a pre-existing balance of the currency, a purchase can consume that reserve to cover the transfer shortfall.",
+      "exploit_steps": [
+        "Have the administrator add a fee-on-transfer ERC20 as a supported payment currency with addCoin().",
+        "Create a listing denominated in that currency.",
+        "Approve the marketplace for the nominal purchase amount and call spotPurchase().",
+        "The token deducts the nominal amount from the buyer but credits the marketplace with less than the requested amount.",
+        "The marketplace still calls safeTransfer() for the full seller proceeds and full fee amount, causing a revert when no reserve exists or consuming any existing marketplace balance to cover the shortfall."
+      ]
+    }
+  ]
+}

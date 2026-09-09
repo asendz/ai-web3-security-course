@@ -1,0 +1,67 @@
+{
+  "_meta": {
+    "note": "Real, unedited output of lucid.agent.find_bugs over the SecondSwap target, captured after the prompt revision (Medium+ only, no self-filtering for importance). Not cherry-picked - saved as returned.",
+    "target": "target/src",
+    "codebase_chars": 93576,
+    "agent": "lucid.agent.find_bugs (single call)",
+    "model": "openai/gpt-5.6-luna",
+    "temperature": 0.3,
+    "reasoning_effort": "high"
+  },
+  "findings": [
+    {
+      "title": "Vesting transfers can cause over-claiming and insolvency",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:216-232 and 161-185",
+      "description": "When transferring a partially claimed vesting, transferVesting reduces totalAmount but recalculates the grantor's releaseRate as grantorVesting.totalAmount / numOfSteps, ignoring the already claimed steps and amount. claimable() then pays releaseRate multiplied by the remaining claimable steps without capping the result against totalAmount - amountClaimed except at the final step.",
+      "impact": "A beneficiary can claim more tokens than their post-transfer allocation. The excess is paid from tokens backing other vestings, and the affected schedule can subsequently become unusable because totalAmount - amountClaimed underflows. Other buyers or beneficiaries may be unable to claim their tokens.",
+      "exploit_steps": [
+        "Use a 10-step vesting with a 100-token allocation and wait until step 5.",
+        "Claim 50 tokens, leaving stepsClaimed = 5 and amountClaimed = 50.",
+        "List 20 tokens through the marketplace. With the default 20% max sell percentage, this is permitted and transferVesting reduces totalAmount to 80 while setting releaseRate to 80 / 10 = 8.",
+        "At step 9, call claim(). claimableSteps is 4 and the non-final branch pays 8 * 4 = 32 tokens, even though only 80 - 50 = 30 tokens remain.",
+        "The vesting records amountClaimed = 82 against totalAmount = 80. At the final step, claimable() underflows on totalAmount - amountClaimed, while the two excess tokens have already been taken from the vesting contract's shared balance."
+      ]
+    },
+    {
+      "title": "Zero step duration permanently disables vesting claims",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:117-134 and 161-174",
+      "description": "The constructor computes stepDuration as (_endTime - _startTime) / _numOfSteps but does not require the vesting duration to be at least the number of steps. A valid deployVesting call only checks startTime < endTime and steps > 0, so a schedule with fewer seconds than steps produces stepDuration == 0. claimable() then divides elapsedTime by stepDuration.",
+      "impact": "After tokens are allocated to such a vesting, every claim attempt reverts due to division by zero, including after the vesting end time. The vesting schedule has no recovery path and its deposited tokens are permanently locked.",
+      "exploit_steps": [
+        "Deploy a vesting with startTime = 1000, endTime = 1001, and steps = 2.",
+        "Create one or more vesting allocations, causing tokens to be transferred into the StepVesting contract.",
+        "After startTime, call claim() for a beneficiary.",
+        "claimable() executes elapsedTime / stepDuration with stepDuration == 0 and reverts permanently, so the deposited tokens cannot be claimed."
+      ]
+    },
+    {
+      "title": "Permissionless whitelist enrollment enables Sybil capacity exhaustion",
+      "severity": "medium",
+      "location": "SecondSwap_Whitelist.sol:57-63",
+      "description": "whitelistAddress() allows any address to enroll itself and consumes one of the finite whitelist slots. There is no seller authorization, signature, payment, identity, or removal mechanism to prevent unrelated addresses from filling the capacity.",
+      "impact": "An attacker using multiple accounts can fill the whitelist before intended buyers enroll. All legitimate buyers then fail the marketplace whitelist check and cannot purchase until the lot owner increases the capacity; the attacker can repeat the process after each increase.",
+      "exploit_steps": [
+        "Observe a private listing whose whitelist has capacity M.",
+        "Submit whitelistAddress() from M distinct attacker-controlled accounts.",
+        "The whitelist reaches totalWhitelist == maxWhitelist.",
+        "Have an intended buyer call spotPurchase(); IWhitelist.validateAddress(msg.sender) returns false and the purchase reverts.",
+        "Repeat with additional accounts if the seller increases maxWhitelist."
+      ]
+    },
+    {
+      "title": "Referral rewards are calculated but never paid",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:478-492",
+      "description": "_handleTransfers computes referralFeeCost but never transfers any currency to _referral. Furthermore, the calculation is inverted relative to the Purchased event: referralFeeCost equals buyerFeeTotal minus the nominal referral portion, while feeCollectorTotal still sends the entire buyerFeeTotal to the fee collector.",
+      "impact": "Referrers receive no referral rewards. The fee collector retains the referral portion of every buyer fee, causing systematic fee mis-accounting and value leakage from the intended referral program.",
+      "exploit_steps": [
+        "Call spotPurchase() with a nonzero _referral address on a non-whitelisted listing.",
+        "The buyer pays baseAmount + buyerFeeTotal.",
+        "The contract computes referralFeeCost but performs no transfer to _referral.",
+        "The contract transfers buyerFeeTotal + sellerFeeTotal in full to feeCollector, so the referral portion is retained by the fee collector."
+      ]
+    }
+  ]
+}

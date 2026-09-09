@@ -1,0 +1,80 @@
+{
+  "_meta": {
+    "note": "Real, unedited output of lucid.agent.find_bugs over the SecondSwap target, captured after the prompt revision (Medium+ only, no self-filtering for importance). Not cherry-picked - saved as returned.",
+    "target": "target/src",
+    "codebase_chars": 93576,
+    "agent": "lucid.agent.find_bugs (single call)",
+    "model": "openai/gpt-5.6-luna",
+    "temperature": 0.3,
+    "reasoning_effort": "high"
+  },
+  "findings": [
+    {
+      "title": "Transfers after claims can over-credit the grantor and drain buyers' vesting tokens",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:216-232",
+      "description": "After reducing the grantor's total allocation, transferVesting recalculates releaseRate as grantorVesting.totalAmount / numOfSteps. This includes tokens already claimed and ignores both amountClaimed and stepsClaimed. The new rate can therefore release more tokens than the grantor's remaining unclaimed allocation. claim() only checks that the calculated amount is greater than zero and does not cap it against totalAmount - amountClaimed.",
+      "impact": "A seller can claim more than their remaining allocation after listing part of a previously claimed vesting schedule. The excess is paid from the vesting contract's balance and makes tokens transferred to marketplace buyers unclaimable. For example, with 10 steps and 100 tokens, claiming 50 at step 5 and then transferring/listing 20 sets the grantor's total to 80 and releaseRate to 8. At step 9 the grantor can claim 32, although only 30 tokens remain unclaimed, consuming 2 tokens belonging to the buyer's 20-token allocation.",
+      "exploit_steps": [
+        "Create a 10-step vesting schedule with a total allocation of 100 tokens and ensure the vesting contract is funded with exactly 100 tokens.",
+        "Wait until step 5 and claim the 50 tokens released so far.",
+        "List 20 tokens through the marketplace; the marketplace calls transferVesting and changes the seller's totalAmount to 80 while leaving amountClaimed at 50, then creates a 20-token allocation for the marketplace.",
+        "Have a buyer purchase the listing, transferring the 20-token vesting allocation from the manager to the buyer.",
+        "At step 9, have the seller call claim(). claimable() calculates 4 remaining steps multiplied by the incorrect releaseRate of 8 and pays the seller 32 tokens.",
+        "Have the buyer claim the purchased allocation. The vesting contract has only 18 tokens remaining, so a claim of the buyer's full 20 tokens reverts or the final portion becomes permanently unclaimable."
+      ]
+    },
+    {
+      "title": "Zero step duration permanently disables claims",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:117-134 and 161-174",
+      "description": "The constructor computes stepDuration as (_endTime - _startTime) / _numOfSteps without requiring the vesting duration to be at least the number of steps. SecondSwap_VestingDeployer.deployVesting only checks that steps is nonzero and startTime is before endTime. If steps exceeds the duration, stepDuration becomes zero, and claimable() later divides elapsedTime by stepDuration.",
+      "impact": "Every beneficiary of such a vesting schedule is permanently unable to claim, because claimable() always reverts with division by zero. The tokens deposited into the vesting contract are permanently locked, and marketplace buyers receiving allocations from the schedule are affected as well.",
+      "exploit_steps": [
+        "Deploy a vesting schedule through SecondSwap_VestingDeployer with startTime = 1000, endTime = 1010, and steps = 11. The deployer accepts these parameters because steps is greater than zero and startTime is less than endTime.",
+        "Create a vesting allocation for a beneficiary, causing the vesting contract to hold the corresponding tokens.",
+        "After the start time, have the beneficiary call claim().",
+        "claimable() executes elapsedTime / stepDuration with stepDuration equal to zero, so the call reverts and no beneficiary can withdraw the allocation."
+      ]
+    },
+    {
+      "title": "Referral rewards are never transferred and the emitted reward is the wrong amount",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:478-492",
+      "description": "_handleTransfers calculates referralFeeCost but never transfers any tokens to _referral or to the configured referralFeeCollector. It then transfers the entire buyerFeeTotal plus sellerFeeTotal to feeCollector. Additionally, the calculated referralFeeCost is buyerFeeTotal minus the configured referral percentage, which is the retained portion of the buyer fee rather than the referral reward itself.",
+      "impact": "Referrers receive no on-chain reward despite the referralFee setting and Purchased event documenting a referral reward. The fee collector retains the entire buyer fee, and the event reports a misleading reward amount, preventing a trustless referral payout mechanism.",
+      "exploit_steps": [
+        "Create an active non-whitelisted listing with a supported payment token.",
+        "Call spotPurchase with a nonzero _referral address different from the buyer.",
+        "Observe that the buyer fee is fully transferred to feeCollector at lines 488-492 and no transfer is made to the referral address or referralFeeCollector.",
+        "For the default 10% referral setting, observe that referralFeeCost is calculated as approximately 90% of the buyer fee rather than the intended 10% reward."
+      ]
+    },
+    {
+      "title": "Out-of-range discounts create listings that cannot be purchased",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:252-260 and 413-420",
+      "description": "listVesting validates only that a non-NO discount is greater than zero; it does not enforce discountPct <= BASE. A FIX listing with discountPct greater than 10000 is accepted, but _getDiscountedPrice evaluates BASE - listing.discountPct and reverts on underflow for every purchase.",
+      "impact": "A seller can create a listing whose purchase path is permanently reverting until the listing is delisted or the minimum listing duration expires. The seller's vesting allocation remains listed and unavailable for normal sale during that period.",
+      "exploit_steps": [
+        "Call listVesting with a supported currency, a valid sellable vesting plan, DiscountType.FIX, and discountPct = 10001.",
+        "The listing succeeds because the only discount validation is discountPct > 0.",
+        "Have any buyer call spotPurchase for any positive amount.",
+        "_getDiscountedPrice evaluates BASE - 10001 and reverts due to uint256 underflow, so the listing cannot be purchased."
+      ]
+    },
+    {
+      "title": "Unbounded token decimals can overflow price normalization and disable marketplace listings",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:264-288 and 459-471",
+      "description": "The marketplace checks only that the vesting token exposes decimals(), while the intended decimals range validation is commented out. It subsequently computes 10 ** decimals(). For a token returning 78 or more decimals, this exponentiation overflows uint256 and reverts.",
+      "impact": "Vesting schedules backed by an otherwise callable ERC20 token with a high decimals value cannot be listed, and any existing listing whose token's decimals() changes to such a value cannot be purchased. This is a recoverable denial of the marketplace's core sale functionality.",
+      "exploit_steps": [
+        "Deploy or use an ERC20 whose decimals() function returns 78.",
+        "Create a sellable vesting plan for that token and create a beneficiary allocation.",
+        "Call listVesting with valid amount, price, currency, and discount parameters.",
+        "The decimals existence check passes, but 10 ** 78 overflows at the baseAmount calculation and the listing transaction reverts."
+      ]
+    }
+  ]
+}
