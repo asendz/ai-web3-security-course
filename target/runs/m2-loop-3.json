@@ -1,0 +1,196 @@
+{
+  "_meta": {
+    "note": "Official lucid.agent.find_bugs_loop (no escape-clause version, post-ablation) - 5 rounds, context + exclusion loop. Real, unedited, not cherry-picked.",
+    "target": "target/src",
+    "codebase_chars": 93576,
+    "context_chars": 26434,
+    "rounds": 5,
+    "model": "openai/gpt-5.6-luna",
+    "temperature": 0.3,
+    "reasoning_effort": "high"
+  },
+  "findings": [
+    {
+      "title": "Listing after partial claims lets sellers overclaim vesting tokens",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:229-232",
+      "description": "transferVesting() reduces grantorVesting.totalAmount and then recalculates releaseRate as grantorVesting.totalAmount / numOfSteps. It does not account for grantorVesting.amountClaimed or the remaining number of steps. As a result, a beneficiary who has already claimed most of their allocation can list the remaining allocation and still receive additional claims from the reduced schedule, even though their available amount is zero.",
+      "impact": "A seller can claim more tokens than remain in their allocation. The excess is paid from tokens backing other beneficiaries or marketplace custody, and the seller's vesting state becomes insolvent. For example, with a 100-token, 10-step schedule, after claiming 80 tokens at step 8, the seller can list the remaining 20 tokens. The transfer sets totalAmount to 80 and releaseRate to 8. At step 9, claimable() returns 8 even though amountClaimed already equals totalAmount. If the listing is sold to another buyer, the seller can claim 88 tokens while the buyer receives the listed 20, draining 8 tokens beyond the original allocation.",
+      "exploit_steps": [
+        "Deploy a sellable 10-step vesting plan and create a 100-token allocation for the attacker.",
+        "At step 8, call claim() to claim 80 tokens.",
+        "Call the marketplace listVesting() for the remaining 20 tokens. The default 20% max-sell limit permits this amount, and the vesting manager transfers it to manager custody.",
+        "Have a buyer purchase the 20-token listing so the manager transfers those tokens to the buyer.",
+        "At step 9, call claim() again. Because transferVesting() set releaseRate to 80 / 10, claimable() returns 8 tokens even though the seller's unclaimed allocation was already zero.",
+        "The seller has received 88 tokens and the buyer has received 20 tokens from a 100-token allocation; the excess 8 tokens come from other tokens held by the vesting contract."
+      ]
+    },
+    {
+      "title": "Non-divisible vesting durations overrun the step count and lock delisted allocations",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:172-181 and SecondSwap_StepVesting.sol:292-303",
+      "description": "claimable() computes currentStep as elapsedTime / stepDuration without capping it to numOfSteps. Since stepDuration is integer-truncated at construction, schedules where (endTime - startTime) is not evenly divisible by numOfSteps can produce currentStep greater than numOfSteps. At the end of such a schedule, claim() stores this excessive value in stepsClaimed. Any later transfer to that beneficiary then evaluates numOfSteps - stepsClaimed and reverts due to underflow.",
+      "impact": "A seller can list tokens, wait until the vesting end, claim their remaining personal allocation, and then become unable to unlist the listing. The manager's remaining listing allocation is permanently stuck because both seller and administrator unlisting invoke transferVesting() into the seller's now-invalid schedule.",
+      "exploit_steps": [
+        "Deploy a vesting plan with startTime = 0, endTime = 5, and numOfSteps = 3. The deployer accepts this configuration and calculates stepDuration = 1.",
+        "Create a 100-token allocation for a seller and list 20 tokens before the end time.",
+        "At timestamp 5, claim() on the seller schedule. claimable() computes currentStep = 5, even though numOfSteps is only 3, and stores stepsClaimed = 5.",
+        "Attempt to unlist the 20-token listing as the seller or administrator.",
+        "The manager transfers the 20 tokens back to the seller, but _createVesting() evaluates numOfSteps - stepsClaimed (3 - 5) and reverts. The manager-held allocation cannot be returned through the marketplace."
+      ]
+    },
+    {
+      "title": "Zero-length step duration makes an entire vesting plan unclaimable",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:130-134 and SecondSwap_StepVesting.sol:172-174",
+      "description": "The constructor derives stepDuration as (_endTime - _startTime) / _numOfSteps but does not require the duration to be at least the number of steps. SecondSwap_VestingDeployer only checks startTime < endTime and steps > 0, so a deployer can create a plan with more steps than seconds in the vesting interval, resulting in stepDuration == 0. Once the start time is reached, claimable() divides by zero.",
+      "impact": "Beneficiaries of the affected plan cannot claim any tokens after vesting starts. Marketplace buyers who receive allocations under the plan also cannot claim them, leaving the plan's token allocations unusable unless an authorized issuer manually migrates them.",
+      "exploit_steps": [
+        "A token owner calls deployVesting() with startTime = 100, endTime = 101, and steps = 2. All deployer validation passes.",
+        "Create a vesting allocation for a beneficiary.",
+        "At timestamp 101 or later, call claim().",
+        "claimable() reaches elapsedTime / stepDuration where stepDuration is zero, causing a division-by-zero revert on every claim attempt."
+      ]
+    },
+    {
+      "title": "Referral rewards are calculated but never paid",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:478-492",
+      "description": "_handleTransfers() calculates referralFeeCost when a referral is supplied, but it never transfers any amount to IMarketplaceSetting(marketplaceSetting).referralFeeCollector() or to _referral. Instead, the complete buyer and seller fees are transferred to feeCollector. The Purchased event also emits the non-reward remainder as referralReward: buyerFeeTotal - (baseAmount * bfee * referralFee / (BASE * BASE)).",
+      "impact": "Referrers receive no referral compensation despite buyers designating them and the event advertising a referral reward. The configured marketplace fee collector retains the entire fee, and off-chain systems relying on referralReward are also given an incorrect amount.",
+      "exploit_steps": [
+        "Configure a listing with a nonzero buyer fee and ensure referralFee is nonzero.",
+        "A buyer approves the payment currency and calls spotPurchase() with a distinct referral address.",
+        "_handleTransfers() charges the buyer the base amount plus the full buyer fee.",
+        "Observe that the only payment destinations are the seller and feeCollector; neither the referral address nor referralFeeCollector receives a transfer.",
+        "The Purchased event nevertheless emits a referralReward value, which is not paid and is the fee remainder rather than the configured referral share."
+      ]
+    },
+    {
+      "title": "Self-purchases bypass the vesting plan maximum sell percentage",
+      "severity": "high",
+      "location": "SecondSwap_Marketplace.sol:387-404; SecondSwap_VestingManager.sol:121-163",
+      "description": "The marketplace does not prevent a seller from purchasing their own listing. A self-purchase causes VestingManager.completePurchase() to increase allocations[seller][plan].bought and transfer the listed allocation back to the seller, while allocations[seller][plan].sold is not reduced. VestingManager.listVesting() then uses the inflated bought value when calculating sellLimit. For an initial allocation T and a 20% cap, the seller can list 0.2T, purchase it themselves, and end with bought == sold == 0.2T and their full T allocation restored. The next listing is accepted because sellLimit becomes bought + T * 20% == 0.4T. Repeating this wash trade increases bought and sold indefinitely without reducing the seller's allocation.",
+      "impact": "A seller can bypass the issuer-configured maximum sell percentage and ultimately sell substantially more than the permitted percentage of their vesting allocation. The cap can be bypassed at the cost of marketplace fees, and becomes especially inexpensive when fees are low or zero.",
+      "exploit_steps": [
+        "Obtain a vesting allocation T in a sellable plan with maxSellPercent set to 2000 (20%), and approve enough payment tokens to the marketplace.",
+        "Create a public listing for approximately 0.2T at a nonzero price.",
+        "Call spotPurchase() on that listing from the same address that created it, with referral set to address(0). The purchase passes because _validatePurchase() checks only that the referral is not the buyer, not that the buyer differs from the seller.",
+        "Observe that the seller's allocation returns to T, allocations[seller][plan].bought increases by 0.2T, and allocations[seller][plan].sold remains 0.2T.",
+        "Create another listing for 0.2T and self-purchase it. The increased bought value raises the sellLimit enough for the next listing.",
+        "Repeat the self-list/self-purchase cycle until the seller has accumulated enough bought accounting, then create listings that are purchased by unrelated buyers. The seller can sell far more than the configured 20% cap."
+      ]
+    },
+    {
+      "title": "Freeze prevents the administrator from delisting active listings",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:190-196 and 339",
+      "description": "unlistVesting() is protected by the isFreeze modifier. When isMarketplaceFreeze() is true, the function reverts before reaching the authorization branch that permits s2Admin to delist without penalty. Thus the administrator's emergency delisting capability is unavailable precisely while the marketplace is frozen.",
+      "impact": "All active listings remain escrowed in the vesting manager during a freeze, and neither the seller nor the administrator can return the remaining allocation. If the freeze is used for incident response or remains active for an extended period, listed users' vesting allocations are unavailable until the marketplace is unfrozen.",
+      "exploit_steps": [
+        "A seller creates an active listing, causing the vesting manager to hold the listed allocation.",
+        "The administrator calls SecondSwap_MarketplaceSetting.setMarketplaceStatus(true).",
+        "The administrator calls SecondSwap_Marketplace.unlistVesting() for the active listing.",
+        "The call reverts in isFreeze() before checking that msg.sender is s2Admin or invoking the vesting manager.",
+        "The seller's unlistVesting() call also reverts, leaving the allocation in marketplace custody while the freeze remains enabled."
+      ]
+    },
+    {
+      "title": "Changing the configured vesting manager strands existing listing escrow",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:560-564; SecondSwap_MarketplaceSetting.sol:285-291; SecondSwap_VestingManager.sol:149-163",
+      "description": "The marketplace does not store the vesting manager used by a listing. Every later unlist and purchase dynamically reads the current marketplaceSetting.vestingManager(). If the administrator rotates the manager through MarketplaceSetting.setManager() or points the marketplace to settings using a different manager, existing allocations remain held by the old manager while later operations call the new manager. The new manager has no allocation for address(this), and the vesting plan's immutable manager is also still the old manager, so unlistVesting() and completePurchase() revert.",
+      "impact": "All listings created before a manager/settings rotation can become unusable, locking their remaining vesting allocations in the old manager and preventing both sellers from delisting and buyers from completing purchases. Restoration is possible only if the administrator can correctly recover and restore the previous configuration.",
+      "exploit_steps": [
+        "Configure the marketplace with settings S1 and vesting manager M1, then create an active listing. The vesting manager transfers the listed allocation into M1's vesting allocation.",
+        "The administrator changes S1's vestingManager to M2, or calls Marketplace.setMarketplaceSettingAddress() with a settings contract that returns M2. Configure M2 to recognize the marketplace if necessary.",
+        "Attempt to purchase the old listing. Marketplace calls M2.completePurchase(), which attempts to transfer from address(M2), although the allocation is held by address(M1), causing the transfer to revert; M2 may also be unauthorized by the vesting plan's immutable manager.",
+        "Attempt to delist the old listing. Marketplace calls M2.unlistVesting(), which likewise cannot transfer the allocation from M1 and reverts.",
+        "The listing remains active and its escrow stays in M1 until the administrator restores the original manager configuration."
+      ]
+    },
+    {
+      "title": "Per-purchase price rounding lets buyers materially underpay",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:_handleTransfers()",
+      "description": "The payment amount is rounded down independently for every purchase with `baseAmount = (_amount * discountedPrice) / (10 ** decimals)`, while `_validatePurchase()` permits arbitrarily small partial purchases when the seller sets a small `minPurchaseAmt`. A seller can list a token with 18 decimals at `pricePerUnit = 10**18 - 1` and `minPurchaseAmt = 2`. Every purchase of 2 vesting-token units then costs `floor(2 * (10**18 - 1) / 10**18) == 1` payment unit, even though the nominal price is almost one payment token per whole token. Repeating the purchases causes the rounding loss to occur once per fill rather than once on the aggregate amount.",
+      "impact": "A buyer can acquire the listing for approximately half of its nominal price under suitable listing parameters. Buyer and seller fees are also rounded per fill and can become zero for small purchases, producing additional fee leakage.",
+      "exploit_steps": [
+        "A seller lists a PARTIAL vesting allocation with an even amount, `discountType == NO`, `pricePerUnit == 10**18 - 1`, and `minPurchaseAmt == 2`.",
+        "The buyer uses a contract or repeated transactions to call `spotPurchase()` for 2 vesting-token units at a time.",
+        "For each fill, `_handleTransfers()` computes `baseAmount == 1` instead of the approximately 2 payment units implied by the configured price.",
+        "After purchasing the full listing, the buyer has paid roughly half of the aggregate unrounded price while receiving the entire vesting allocation."
+      ]
+    },
+    {
+      "title": "The default early-delisting penalty is mis-scaled for standard USDT",
+      "severity": "medium",
+      "location": "SecondSwap_MarketplaceSetting.sol:144 and SecondSwap_Marketplace.sol:349-360",
+      "description": "The default `penaltyFee` is initialized as `10 ether` and is transferred as a raw amount of the configured `usdt` token. No conversion based on the USDT token's decimals is performed. For a standard 6-decimal USDT contract, `10 ether` means `10**19` base units, or 10,000,000,000,000 USDT, rather than 10 USDT.",
+      "impact": "Under the standard USDT configuration, ordinary sellers cannot early-del\u10d8\u10e1\u10e2 a listing unless they hold an effectively impossible penalty balance and allowance. Their allocation remains escrowed until the minimum listing duration expires or an administrator intervenes, causing a recoverable denial of service for early withdrawals.",
+      "exploit_steps": [
+        "Deploy or configure the marketplace with a standard 6-decimal USDT token.",
+        "Create a listing and attempt to delist it before `minListingDuration()` elapses.",
+        "The marketplace requires `usdt.balanceOf(msg.sender) >= 10**19` raw units.",
+        "A normal seller fails this check and cannot delist early, even though the intended penalty is the configured 10-token amount."
+      ]
+    },
+    {
+      "title": "Unprotected upgradeable initializers permit protocol takeover",
+      "severity": "critical",
+      "location": "SecondSwap_VestingManager.sol:107; SecondSwap_Marketplace.sol:180; SecondSwap_VestingDeployer.sol:77",
+      "description": "The upgradeable contracts expose public initialize() functions protected only by the initializer-once guard; they do not authenticate the initializer and do not disable initialization on the implementation. If a proxy is deployed without atomic initialization, any account can become the administrator or configure the marketplace before the intended deployment transaction executes. In particular, an attacker who initializes VestingManager first becomes s2Admin and can set marketplace to an attacker-controlled helper.",
+      "impact": "After taking over an uninitialized VestingManager proxy, the attacker can authorize an arbitrary marketplace helper, mark compatible vesting plans sellable, and use the helper to list allocations from arbitrary sellers and complete purchases to the attacker's address. The manager's listVesting() accepts the seller as a parameter and does not require it to be msg.sender, while the vesting plans recognize the compromised manager as an authorized transfer operator. This allows direct theft of a permitted portion of users' vesting allocations and permanently disrupts the intended marketplace configuration.",
+      "exploit_steps": [
+        "Observe deployment of a VestingManager proxy that has not yet been initialized.",
+        "Call SecondSwap_VestingManager.initialize(attacker) before the intended initializer; attacker is now s2Admin.",
+        "Call setMarketplace(attackerHelper) from the attacker account.",
+        "For a vesting plan whose immutable manager is this VestingManager, call setSellable(plan, true) if necessary.",
+        "From attackerHelper, call listVesting(victim, plan, amount), where amount is within the plan's sell limit. The manager transfers the allocation from victim to itself because it trusts the helper and accepts victim as an arbitrary seller parameter.",
+        "From attackerHelper, call completePurchase(attacker, plan, amount). The manager transfers the escrowed allocation from itself to the attacker."
+      ]
+    },
+    {
+      "title": "Aggregating escrow allocations loses each allocation's vesting progress",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:288-304 and SecondSwap_VestingManager.sol:121-163",
+      "description": "The vesting manager uses the single address(this) beneficiary in each plan to aggregate all marketplace escrow. When _createVesting() adds an allocation to an existing beneficiary, it ignores the supplied _stepsClaimed value and retains the existing beneficiary's stepsClaimed. Subsequent transferVesting() calls then pass this aggregated manager stepsClaimed to buyers or sellers instead of the source allocation's stepsClaimed.",
+      "impact": "A purchase or delisting can give an allocation an incorrect release schedule. Depending on the first escrowed allocation, buyers can receive tokens earlier than their source allocation permits or have otherwise-vested tokens locked until the first escrow schedule reaches its step. This breaks vesting progress preservation and can materially change the economic unlock timing of traded allocations.",
+      "exploit_steps": [
+        "Create a ten-step vesting plan and allocate tokens to seller A and seller B.",
+        "At step 4, have seller A claim four steps and list the remaining allocation. The manager's first escrow schedule is created with stepsClaimed equal to 4.",
+        "At the same time, have untouched seller B list an allocation whose source schedule has stepsClaimed equal to 0.",
+        "The manager's _createVesting() existing-beneficiary branch adds B's escrow amount but ignores B's _stepsClaimed value, so the manager allocation continues to have stepsClaimed equal to 4.",
+        "Have buyer C purchase B's listing. completePurchase() transfers from the manager, and the buyer's new schedule is created with the manager's stepsClaimed value of 4.",
+        "At step 4, C's schedule reports zero claimable steps, even though B's original unclaimed allocation would have had four elapsed steps. Conversely, if the first escrow schedule has fewer claimed steps than a later source allocation, the later buyer can unlock those tokens prematurely."
+      ]
+    },
+    {
+      "title": "Discount bounds are not validated, creating unpurchasable listings",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:258-260 and SecondSwap_Marketplace.sol:413-421",
+      "description": "listVesting() only checks that a non-NO discount is greater than zero; it never enforces the documented maximum of BASE (10000). Moreover, a valid 10000 discount is accepted, but _getDiscountedPrice() returns zero for a FIX discount and _handleTransfers() subsequently requires the calculated baseAmount to be greater than zero. Discounts above BASE underflow at BASE - discountPct during purchase.",
+      "impact": "A listing can be successfully escrowed while every purchase reverts. A 100% fixed discount is accepted by listVesting() but produces a zero purchase amount, and discounts above 100% revert during price calculation. The seller's allocation remains locked in marketplace escrow until the seller or administrator delists it, potentially requiring the early-delisting penalty.",
+      "exploit_steps": [
+        "Call listVesting() with a valid amount and price, DiscountType.FIX, and discountPct equal to 10000. The initial undiscounted baseAmount is positive, so listing succeeds and the vesting allocation is transferred to the manager.",
+        "Have any buyer call spotPurchase() for the listing.",
+        "_getDiscountedPrice() computes discountedPrice as zero, and _handleTransfers() reverts at require(baseAmount > 0).",
+        "Alternatively, create the listing with discountPct greater than 10000; every purchase path that evaluates BASE - discountPct reverts due to arithmetic underflow.",
+        "The listing cannot be sold and must be delisted after the minimum duration or by paying the early-delisting penalty."
+      ]
+    },
+    {
+      "title": "Token issuer can drain marketplace escrow allocations",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:216-232",
+      "description": "transferVesting() authorizes tokenIssuer and vestingDeployer to transfer from any _grantor, without restricting the grantor to the caller's own allocation or excluding the marketplace manager's escrow allocation. Marketplace listings are held under address(manager), so an authorized token issuer can directly transfer those escrowed vesting allocations to an arbitrary beneficiary. The VestingManager's allocations[seller][plan].sold accounting and marketplace listing state are not updated by this direct transfer.",
+      "impact": "A token issuer or vesting-deployer-controlled caller can steal vesting allocations backing active listings. The affected listing remains active in marketplace and manager accounting, but unlisting and purchases revert once the manager's vesting balance has been removed, permanently locking the seller's listing unless the attacker restores the allocation.",
+      "exploit_steps": [
+        "A seller lists amount A of a sellable vesting plan through SecondSwap_Marketplace, causing SecondSwap_VestingManager to transfer A units into the vesting plan's allocation for address(manager).",
+        "The plan's tokenIssuer calls SecondSwap_StepVesting(plan).transferVesting(address(manager), attacker, A), or invokes the equivalent transfer through the vesting deployer.",
+        "transferVesting() passes its authorization check, reduces the manager allocation, and creates an allocation for attacker without notifying the VestingManager or Marketplace.",
+        "The attacker later claims the transferred vesting allocation, while the seller's active listing cannot be fulfilled and manager.unlistVesting()/completePurchase() revert because the manager allocation is insufficient."
+      ]
+    }
+  ]
+}

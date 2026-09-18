@@ -1,0 +1,131 @@
+{
+  "_meta": {
+    "note": "Official lucid.agent.find_bugs_loop (no escape-clause version, post-ablation) - 5 rounds, context + exclusion loop. Sequence 1 of the 5-sequence set. Real, unedited, not cherry-picked.",
+    "target": "target/src",
+    "codebase_chars": 93576,
+    "context_chars": 26589,
+    "rounds": 5,
+    "model": "openai/gpt-5.6-luna",
+    "temperature": 0.3,
+    "reasoning_effort": "high"
+  },
+  "findings": [
+    {
+      "title": "Post-transfer release rate allows sellers to overclaim and drain buyers",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:216-232",
+      "description": "When transferring an allocation, the grantor's totalAmount is reduced but amountClaimed and stepsClaimed are retained. The release rate is then incorrectly recalculated as grantorVesting.totalAmount / numOfSteps. It should be based on the remaining unclaimed amount and remaining steps. claimable() subsequently uses this inflated rate without capping the result at totalAmount - amountClaimed in the non-final-step branch.",
+      "impact": "A seller who has already claimed tokens can list the remainder, causing their vesting record to report additional claimable tokens despite having no available allocation. If the listing is purchased, the seller can claim more than their original allocation, draining tokens backing the buyer's allocation and causing the buyer's later claims to revert or become underfunded.",
+      "exploit_steps": [
+        "Use a vesting plan with 10 steps and a beneficiary allocation of 100 tokens.",
+        "Wait until step 8 and have the beneficiary claim 80 tokens.",
+        "List the remaining 20 tokens. The manager accepts this under the default 20% max-sell limit and transferVesting reduces the beneficiary's totalAmount from 100 to 80 while amountClaimed remains 80.",
+        "The transfer recalculates the beneficiary's releaseRate to 80 / 10 = 8 instead of using the zero remaining allocation.",
+        "At step 9, call claim again. claimable() returns 8 tokens even though amountClaimed already equals totalAmount, and the contract transfers those 8 tokens.",
+        "Have a buyer purchase the active 20-token listing. The buyer's allocation is now backed by a vesting contract whose balance has already been drained by the seller's extra 8-token claim; the buyer's final claim reverts or cannot be fully paid."
+      ]
+    },
+    {
+      "title": "Zero step duration permanently blocks vesting claims",
+      "severity": "high",
+      "location": "SecondSwap_VestingDeployer.sol:104-133 and SecondSwap_StepVesting.sol:117-134, 161-174",
+      "description": "deployVesting only requires steps > 0 and does not require endTime - startTime to be at least steps. The StepVesting constructor therefore permits stepDuration = (endTime - startTime) / numOfSteps to equal zero. Once a beneficiary's vesting starts, claimable() executes elapsedTime / stepDuration, causing every claim to revert by division by zero.",
+      "impact": "A valid, sellable vesting plan can be deployed with funded allocations that beneficiaries can never claim through the vesting contract. Any purchased allocation from such a plan is likewise unclaimable, permanently locking the backing tokens unless a trusted allocation operator intervenes.",
+      "exploit_steps": [
+        "A token owner deploys a vesting plan with startTime = T, endTime = T + 1, and steps = 2.",
+        "The deployer accepts the parameters and marks the new plan sellable.",
+        "The token owner creates and funds an allocation for a beneficiary.",
+        "After T, the beneficiary calls claim().",
+        "claimable() reaches elapsedTime / stepDuration with stepDuration equal to zero, so the call reverts and the beneficiary cannot claim any tokens."
+      ]
+    },
+    {
+      "title": "Non-divisible schedules can record more claimed steps than exist",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:167-181 and 197-200",
+      "description": "claimable() computes currentStep as elapsedTime / stepDuration without capping it to numOfSteps. Because stepDuration is integer-truncated, currentStep can exceed numOfSteps before or at endTime. The final-step branch returns the remaining amount but also returns the excessive claimableSteps, and claim() stores that value in stepsClaimed.",
+      "impact": "For valid schedules where the truncated step duration does not evenly cover the schedule, a beneficiary can end with stepsClaimed greater than numOfSteps. Subsequent allocations to that beneficiary revert due to numOfSteps - stepsClaimed underflow, preventing legitimate future vesting grants from being created or transferred to that address.",
+      "exploit_steps": [
+        "Deploy a plan with startTime = T, endTime = T + 4, and steps = 3. The derived stepDuration is 1.",
+        "Create and fund an allocation for a beneficiary.",
+        "Wait until endTime. claimable() computes currentStep as 4 even though numOfSteps is 3.",
+        "The beneficiary calls claim(); the final branch pays the full remaining allocation but returns claimableSteps = 4, so stepsClaimed becomes 4.",
+        "Later, the token issuer calls createVesting() to add a new allocation to the same beneficiary.",
+        "The existing-beneficiary path evaluates numOfSteps - stepsClaimed, which underflows because 3 - 4 is negative, so the new vesting allocation cannot be created."
+      ]
+    },
+    {
+      "title": "Discount percentages above 100% create unpurchasable listings",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:257-260 and 413-421",
+      "description": "listVesting validates only that a non-NO discount is greater than zero; it never enforces discountPct <= BASE. A FIX discount of 10000 makes the discounted price zero and causes _handleTransfers() to revert on baseAmount > 0. A FIX discount above 10000 underflows in BASE - listing.discountPct. Linear discounts likewise underflow or produce unusable pricing for sufficiently large purchases.",
+      "impact": "A seller can create a listing that is marked LIST and has its vesting allocation transferred into marketplace custody, but every purchase reverts. The allocation remains locked until the seller waits through the minimum duration or pays the early-unlisting penalty, and the listing cannot fulfill its core sale function.",
+      "exploit_steps": [
+        "Call listVesting() with a valid amount and price, ListingType.SINGLE, DiscountType.FIX, and discountPct = 10000.",
+        "The listing passes validation because discountPct is only checked to be nonzero, and the vesting allocation is transferred to the vesting manager.",
+        "A buyer calls spotPurchase() for the full listing amount.",
+        "_getDiscountedPrice() returns zero, so _handleTransfers() computes baseAmount = 0 and reverts on the baseAmount > 0 check.",
+        "Repeat purchases continue to revert, leaving the listing unusable until it can be delisted under the configured penalty and duration rules."
+      ]
+    },
+    {
+      "title": "Duplicate token-owner mappings grant issuer-level transfer authority",
+      "severity": "high",
+      "location": "SecondSwap_VestingDeployer.sol:setTokenOwner and transferVesting",
+      "description": "setTokenOwner only checks that the owner address has no existing mapping: require(_tokenOwner[_owner] == address(0)). It does not ensure that the token is not already assigned to another owner. Any additional address mapped to the same ERC20 token therefore passes transferVesting's authorization check. The deployer then calls SecondSwap_StepVesting.transferVesting with itself as msg.sender, and that function accepts the deployer as an authorized caller while allowing an arbitrary grantor address.",
+      "impact": "If an attacker is assigned to a token that already backs existing vesting plans, the attacker can transfer any beneficiary's unclaimed allocation from those plans to an address they control, bypassing the marketplace and vesting-manager accounting, and can subsequently claim the stolen tokens.",
+      "exploit_steps": [
+        "Have the administrator assign token T to a legitimate owner using setTokenOwner(T, legitimateOwner).",
+        "Have the administrator assign the same token T to attacker using setTokenOwner(T, attacker); this succeeds because _tokenOwner[attacker] is still zero.",
+        "Identify a StepVesting plan backed by token T and a victim with an unclaimed allocation.",
+        "Call transferVesting(victim, attacker, amount, plan, transactionId) from attacker. The token-owner check succeeds because _tokenOwner[attacker] == T.",
+        "The deployer calls plan.transferVesting, which accepts the deployer as an authorized caller and moves the victim's vesting allocation to attacker.",
+        "Call claim on the vesting plan as attacker to withdraw released tokens."
+      ]
+    },
+    {
+      "title": "Vesting-manager aggregation loses the source allocation's vesting progress",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:_createVesting",
+      "description": "When the beneficiary already has a vesting record, _createVesting adds the new amount to totalAmount but leaves the beneficiary's existing stepsClaimed and amountClaimed unchanged. Marketplace custody is pooled under the vesting manager address, so allocations from different sellers with different claim progress are merged into one record. Later, when an allocation is purchased, transferVesting copies the pooled manager record's stepsClaimed to the buyer instead of preserving the source allocation's vesting progress.",
+      "impact": "A buyer can receive an allocation with an incorrect release schedule. In a normal schedule, an allocation that has been vested but not claimed should remain immediately claimable after transfer; instead, pooled custody can reset or advance its effective progress and temporarily lock claimable tokens until later vesting steps or the end of the schedule.",
+      "exploit_steps": [
+        "Create a ten-step vesting plan and give seller A and seller B separate allocations large enough to list.",
+        "Allow the schedule to reach step 5. Seller B claims five steps, then lists part of B's remaining allocation. The manager receives its first allocation with stepsClaimed equal to 5.",
+        "Seller A, who has not claimed any tokens, lists part of A's allocation after step 5. The manager already has a vesting record, so _createVesting only increases totalAmount and retains stepsClaimed equal to 5.",
+        "A buyer purchases A's listing. transferVesting creates the buyer's record using the manager's retained stepsClaimed value of 5.",
+        "At step 6, the buyer's purchased allocation is treated as having only one remaining claimable step and can claim only 1/5 of that allocation's amount, even though A's unclaimed allocation should have accumulated six of ten vesting steps and substantially more should be claimable."
+      ]
+    },
+    {
+      "title": "Seller can bypass max-sell limits by purchasing their own listings",
+      "severity": "high",
+      "location": "SecondSwap_Marketplace.sol:_validatePurchase; SecondSwap_VestingManager.sol:listVesting and completePurchase",
+      "description": "The marketplace does not reject purchases where msg.sender equals listing.seller. A seller can therefore purchase each of their own listings. completePurchase credits the seller's allocations[seller][vesting].bought amount, while listVesting uses that bought amount to increase the seller's future sellLimit. The seller can repeatedly list a tranche, buy it back, receive bought credit, and then list another tranche. For example, with a 100-token allocation and maxSellPercent of 20%, after listing and self-purchasing 20 tokens, bought becomes 20 and sold remains 20; the next listing is permitted because sellLimit becomes 20 + (100 + 20 - 20) * 20% = 40. Repeating this process manufactures enough bought credit to list the entire original allocation.",
+      "impact": "A seller can circumvent the vesting plan's maximum sale percentage and ultimately sell substantially more tokens than the configured limit. The seller must temporarily fund the self-purchases and pay configured fees, but the purchased vesting allocation is returned to the seller, allowing the cap to be bypassed rather than enforcing the protocol's sale restriction.",
+      "exploit_steps": [
+        "Obtain an unclaimed allocation of 100 tokens in a sellable vesting plan whose maxSellPercent is 2000 (20%), with allocations[seller][plan].bought and sold initially zero.",
+        "Approve the marketplace to spend the payment currency and create a partial listing for 20 tokens.",
+        "Call spotPurchase for that listing from the seller address itself, using the seller as msg.sender. The seller pays the purchase amount and fees, receives the vesting allocation back through completePurchase, and allocations[seller][plan].bought increases by 20 while sold remains 20.",
+        "Create a second 20-token listing. listVesting now computes a sell limit of 20 + ((100 + 20 - 20) * 2000 / 10000) = 40, so sold can increase from 20 to 40.",
+        "Self-purchase the second listing and repeat the list/self-purchase cycle. Each cycle increases bought and permits another tranche to be listed.",
+        "After manufacturing sufficient bought credit, list the remaining allocation and sell it to external buyers, exceeding the configured 20% maximum."
+      ]
+    },
+    {
+      "title": "Per-purchase rounding lets buyers underpay partial listings",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:459-470 (_handleTransfers)",
+      "description": "The payment amount is rounded down independently for every partial purchase using `(_amount * discountedPrice) / 10 ** decimals`. There is no aggregation or minimum-purchase constraint that prevents a buyer from repeatedly choosing amounts whose individually rounded price is materially below their proportional price. For example, with a vesting token having 1 decimal, a partial listing of 1000 raw units at `_price = 9`, and `minPurchaseAmt = 1`, a single purchase would cost `1000 * 9 / 10 = 900` payment units. Instead, a buyer can make 500 purchases of 2 raw units; each costs `floor(2 * 9 / 10) = 1`, for a total payment of only 500 units.",
+      "impact": "A buyer can acquire the full listed vesting allocation while paying substantially less than the advertised price. Fee rounding also compounds the loss because fees are calculated separately for each rounded base amount and may round to zero on every small purchase. With a zero-decimal payment token, the example causes the seller to receive 500 units instead of 900.",
+      "exploit_steps": [
+        "Obtain a supported payment token with discrete units and a vesting token whose `decimals()` returns 1.",
+        "Have a seller create a PARTIAL listing for 1000 raw vesting units with `_price = 9`, no discount, and `minPurchaseAmt = 1`.",
+        "Approve the marketplace to spend the payment token.",
+        "Call `spotPurchase` 500 times with `_amount = 2` and the same listing ID.",
+        "Each call passes validation, transfers only `floor(2 * 9 / 10) = 1` payment unit, and transfers 2 vesting units to the buyer.",
+        "After the final call, the buyer owns all 1000 vesting units while having paid 500 payment units rather than the 900 units charged by a single purchase."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,114 @@
+{
+  "_meta": {
+    "note": "Official lucid.agent.find_bugs_loop (no escape-clause version, post-ablation) - 5 rounds, context + exclusion loop. Real, unedited, not cherry-picked.",
+    "target": "target/src",
+    "codebase_chars": 93576,
+    "context_chars": 24940,
+    "rounds": 5,
+    "model": "openai/gpt-5.6-luna",
+    "temperature": 0.3,
+    "reasoning_effort": "high"
+  },
+  "findings": [
+    {
+      "title": "Vesting transfers can over-credit the grantor and make the vesting pool insolvent",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:229-230, function transferVesting",
+      "description": "When transferring an unclaimed allocation from a partially claimed schedule, the contract decreases totalAmount but leaves amountClaimed and stepsClaimed unchanged, then recalculates releaseRate as grantorVesting.totalAmount / numOfSteps. The rate must instead be based on the remaining allocation and remaining steps: (totalAmount - amountClaimed) / (numOfSteps - stepsClaimed). The current rate can release more tokens than the grantor's post-transfer totalAmount, causing amountClaimed to exceed totalAmount.",
+      "impact": "A seller can list part of an already-partially-claimed vesting allocation and subsequently claim more tokens than remain in their schedule. The excess is taken from other allocations held by the vesting contract, including a buyer's purchased allocation, creating an insolvency and potentially preventing buyers from claiming their purchased tokens.",
+      "exploit_steps": [
+        "Use a 10-step vesting plan with a seller allocated 100 tokens and the marketplace's default 20% maximum sell percentage.",
+        "Allow five steps to elapse and have the seller claim 50 tokens. The seller's schedule now has totalAmount = 100, amountClaimed = 50, and stepsClaimed = 5.",
+        "Have the seller list 20 tokens. The marketplace manager transfers the 20-token unclaimed allocation, and transferVesting changes the seller's totalAmount to 80 but sets releaseRate to 80 / 10 = 8 instead of 50 / 5 = 10.",
+        "Have a buyer purchase the listing so the buyer receives a 20-token vesting allocation.",
+        "At step 9, the seller claims four newly available steps, receiving 32 tokens and setting amountClaimed to 82 even though totalAmount is only 80.",
+        "The seller has received two tokens more than their post-listing allocation. The vesting contract is now short two tokens against the buyer's 20-token allocation, causing the buyer's later claim to revert or consume collateral from other schedules."
+      ]
+    },
+    {
+      "title": "Zero-duration vesting steps permanently disable claims",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:133 and 167-174; SecondSwap_VestingDeployer.sol:104-117",
+      "description": "The deployer validates only startTime < endTime and steps > 0, but does not require endTime - startTime >= steps. The StepVesting constructor therefore permits stepDuration to become zero through integer division. claimable() subsequently divides elapsedTime by stepDuration, causing every post-start claimable() and claim() call to revert.",
+      "impact": "Allocations in a validly deployed but misconfigured vesting plan can never be claimed. If such allocations are listed and sold, buyers pay for vesting tokens that are permanently locked in the vesting contract, while the seller receives the marketplace payment.",
+      "exploit_steps": [
+        "A token owner deploys a vesting plan through SecondSwap_VestingDeployer with startTime = T, endTime = T + 1, and steps = 2. These parameters pass the deployer's checks.",
+        "The StepVesting constructor sets stepDuration to (1 / 2) = 0.",
+        "The issuer creates and funds an allocation in the plan, and the seller lists it on the marketplace.",
+        "A buyer purchases the listing and receives the allocation through the vesting manager.",
+        "After startTime, the buyer calls claim(). claimable() executes elapsedTime / stepDuration with a zero divisor and reverts, permanently preventing the buyer from withdrawing the purchased tokens."
+      ]
+    },
+    {
+      "title": "Vesting schedules can record more claimed steps than exist and reject all future grants",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:167-181 and 197-200",
+      "description": "claimable() computes currentStep as elapsedTime / stepDuration but never caps it at numOfSteps. When the vesting duration is not evenly divisible by the number of steps, the truncated stepDuration can make currentStep exceed numOfSteps. At the end of vesting, claimableSteps can therefore exceed the remaining steps, and claim() stores stepsClaimed greater than numOfSteps. Any later _createVesting() call for that beneficiary evaluates numOfSteps - stepsClaimed and underflows at line 297.",
+      "impact": "A beneficiary who has fully claimed such a schedule cannot receive additional allocations. In the marketplace, a buyer with this existing schedule cannot purchase further tokens from the same plan because completePurchase's transferVesting call reverts, causing a recoverable denial of service for that buyer.",
+      "exploit_steps": [
+        "Deploy a plan with a 10-second duration and 6 steps. The deployer accepts these parameters and StepVesting sets stepDuration to 1 second.",
+        "Create an allocation for a beneficiary and wait until endTime. currentStep becomes 10 even though numOfSteps is 6.",
+        "The beneficiary calls claim(). claimable() returns the full remaining allocation but also returns claimableSteps = 10, and claim() stores stepsClaimed = 10.",
+        "Later, attempt to add another vesting allocation to the beneficiary, or have the beneficiary purchase tokens from the plan after the prior allocation has been fully claimed.",
+        "Because the beneficiary's totalAmount is nonzero, _createVesting() evaluates numOfSteps - stepsClaimed, which underflows and reverts, preventing the new grant or marketplace purchase."
+      ]
+    },
+    {
+      "title": "Marketplace escrow merges vesting schedules and changes claim timing",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:_createVesting (lines 288-304); SecondSwap_VestingManager.sol:completePurchase (lines 161-164)",
+      "description": "The vesting manager aggregates all marketplace escrow into the single beneficiary address(address(this)). When _createVesting is called for an existing beneficiary, it increases totalAmount but ignores the _stepsClaimed value supplied for the newly transferred allocation and retains the existing beneficiary's stepsClaimed. Marketplace purchases then transfer tokens from this pooled schedule to buyers using the pooled stepsClaimed. Consequently, allocations from sellers at different vesting progress points inherit whichever progress state the manager's first escrowed allocation established.",
+      "impact": "A buyer can receive and claim tokens earlier than the source seller's vesting progress allows, or have them delayed incorrectly. This breaks per-allocation vesting guarantees and can allow purchased vested tokens to be released prematurely and dumped before their intended release schedule.",
+      "exploit_steps": [
+        "Use a 10-step vesting plan. Give Alice an unclaimed allocation and give Bob an allocation from which Bob has already claimed the first 8 steps, leaving 20 tokens available.",
+        "Alice lists first while her stepsClaimed is 0, causing the manager's StepVesting record to be created with stepsClaimed == 0.",
+        "Bob lists his remaining 20 tokens. The manager calls transferVesting with Bob's stepsClaimed == 8, but because the manager already has a vesting record, _createVesting retains the manager record's stepsClaimed == 0.",
+        "The attacker purchases Bob's listing. completePurchase transfers from the manager, and the buyer's new record is initialized with the manager's stepsClaimed == 0.",
+        "At step 8, the buyer calls claim(). The buyer's 20-token allocation has a release rate of 2 tokens per step and can claim 16 tokens immediately, even though Bob's source allocation had already progressed to step 8 and the transferred remainder should retain that progress."
+      ]
+    },
+    {
+      "title": "Transfers from fully claimed schedules can revert due to division by zero",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:_createVesting (lines 288-303)",
+      "description": "If a beneficiary has already claimed all steps, their record has stepsClaimed == numOfSteps while totalAmount remains nonzero and amountClaimed equals totalAmount. A later grant to that beneficiary enters the existing-record branch, increases totalAmount, and sets releaseRate to zero because numOfSteps - stepsClaimed == 0. The newly available grant can then be transferred, but if the destination has no existing vesting record, the new-record branch calculates releaseRate as _totalAmount / (numOfSteps - _stepsClaimed), where _stepsClaimed == numOfSteps, causing a division-by-zero revert.",
+      "impact": "A beneficiary who receives a new allocation after fully claiming a prior allocation cannot transfer that new allocation to a fresh beneficiary. In the marketplace, if the manager has no existing escrow record, listing such an allocation reverts, denying the owner the ability to sell it even though available() reports a positive balance.",
+      "exploit_steps": [
+        "Deploy a normal plan with an exact duration divisible by its number of steps, for example 10 steps over 1000 seconds.",
+        "Create a 100-token schedule for a beneficiary and let it fully vest; the beneficiary calls claim(), leaving stepsClaimed == 10, totalAmount == 100, and amountClaimed == 100.",
+        "Create an additional 10-token schedule for the same beneficiary. The existing-record branch increases totalAmount to 110, leaves stepsClaimed at 10, and reports 10 tokens as available.",
+        "Have the beneficiary call transferVesting through the vesting deployer to a fresh recipient, or list the 10 tokens through the marketplace when the manager has no escrow record.",
+        "The transfer invokes _createVesting for the fresh recipient with _stepsClaimed == 10, and line 292 divides by numOfSteps - _stepsClaimed == 0, reverting the entire transfer or listing."
+      ]
+    },
+    {
+      "title": "Token-only authorization permits cross-issuer vesting theft",
+      "severity": "high",
+      "location": "SecondSwap_VestingDeployer.sol:176-181 and 218-229; SecondSwap_VestingDeployer.sol:141-144",
+      "description": "The deployer's createVesting and transferVesting authorization checks only that _tokenOwner[msg.sender] equals the selected vesting contract's token. They do not verify that msg.sender is the tokenIssuer of that vesting plan. setTokenOwner permits the same token to be assigned to multiple owners because it checks only whether the owner has an existing mapping, not whether the token is already assigned. Once two owners share a token mapping, one owner can invoke the deployer against the other owner's vesting plans. The deployer is an authorized caller in SecondSwap_StepVesting, so the selected plan accepts the operation.",
+      "impact": "A token owner assigned the same token as another issuer can transfer any available beneficiary allocation from the other issuer's vesting plan to an address it controls. It can also create allocations on the other issuer's plan; because StepVesting funds externally created schedules from that plan's tokenIssuer, this can pull tokens from the victim issuer's allowance and assign them to the attacker.",
+      "exploit_steps": [
+        "The administrator calls setTokenOwner(T, victimIssuer) and setTokenOwner(T, attacker); both calls are accepted because the second call checks only _tokenOwner[attacker], not whether T is already assigned.",
+        "victimIssuer deploys a StepVesting plan P for token T and creates an allocation for victimBeneficiary.",
+        "attacker calls SecondSwap_VestingDeployer.transferVesting(victimBeneficiary, attacker, amount, P, transactionId).",
+        "The deployer check passes because _tokenOwner[attacker] == T == P.token().",
+        "P.transferVesting executes with the deployer as msg.sender, which is authorized by StepVesting, and moves the victimBeneficiary allocation to attacker.",
+        "Alternatively, if victimIssuer has approved P to fund schedules, attacker calls createVesting(attacker, amount, P); P pulls amount from P.tokenIssuer (victimIssuer) and credits the allocation to attacker."
+      ]
+    },
+    {
+      "title": "Per-transaction price flooring allows buyers to systematically underpay",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:_handleTransfers (lines 459-476)",
+      "description": "The purchase price is independently rounded down with `baseAmount = (_amount * discountedPrice) / 10 ** decimals` for every purchase. There is no mechanism to preserve fractional remainders or enforce a minimum purchase size that prevents material rounding loss. Because PARTIAL listings allow `minPurchaseAmt == 0`, buyers can split a purchase into chunks and pay the rounded-down amount for each chunk. For example, with an 18-decimal vesting token, a zero-decimal supported payment token, and a price of 19 payment units per whole token, each 0.1-token purchase computes to `floor(0.1 * 19) == 1` payment unit instead of 1.9 units.",
+      "impact": "A buyer can obtain a material discount by splitting a purchase across multiple transactions. In the example, ten purchases acquire one whole token for 10 payment units instead of the intended normalized price of 19 units, causing the seller to lose 9 units (before any applicable fees).",
+      "exploit_steps": [
+        "Ensure a sellable vesting plan has a seller allocation and that a zero-decimal ERC20 is a supported payment currency.",
+        "The seller creates a PARTIAL listing for `1e18` vesting-token units with `_price = 19`, no discount, and `_minPurchaseAmt = 0`; listing creation succeeds because the total base amount is `19 > 0`.",
+        "The buyer approves the marketplace for 10 payment-token units.",
+        "The buyer calls `spotPurchase` ten times for the same listing, each time with `_amount = 1e17` and no referral. Each call passes the minimum and balance checks and computes `floor(1e17 * 19 / 1e18) == 1` payment unit.",
+        "After the tenth call, the buyer has received the full listed token amount while paying only 10 payment units; the seller receives only 10 units rather than the 19-unit normalized price."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,181 @@
+{
+  "_meta": {
+    "note": "Official lucid.agent.find_bugs_loop (no escape-clause version, post-ablation) - 5 rounds, context + exclusion loop. Real, unedited, not cherry-picked.",
+    "target": "target/src",
+    "codebase_chars": 93576,
+    "context_chars": 26359,
+    "rounds": 5,
+    "model": "openai/gpt-5.6-luna",
+    "temperature": 0.3,
+    "reasoning_effort": "high"
+  },
+  "findings": [
+    {
+      "title": "Zero step duration permanently disables vesting claims",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:133, SecondSwap_StepVesting.sol:173",
+      "description": "The constructor calculates `stepDuration = (_endTime - _startTime) / _numOfSteps` without requiring the schedule duration to be at least the number of steps. `SecondSwap_VestingDeployer.deployVesting` only checks `startTime < endTime` and `steps > 0`, so a valid deployment with `endTime - startTime < steps` creates a vesting contract with `stepDuration == 0`. Once the schedule starts, `claimable()` executes `elapsedTime / stepDuration` and always reverts.",
+      "impact": "All allocations created in the affected vesting contract become permanently unclaimable after `startTime`, locking the underlying token reserve and breaking the vesting guarantee.",
+      "exploit_steps": [
+        "A token owner mapped in `SecondSwap_VestingDeployer` calls `deployVesting` with `startTime < endTime` but `endTime - startTime < steps`, for example a one-second schedule with 10 steps.",
+        "Create and fund a vesting allocation in the resulting `SecondSwap_StepVesting` contract.",
+        "Wait until `block.timestamp >= startTime`.",
+        "The beneficiary calls `claim()`; `claimable()` divides by the zero `stepDuration` and reverts permanently."
+      ]
+    },
+    {
+      "title": "Vesting transfers can over-credit claimed amounts and drain the reserve",
+      "severity": "high",
+      "location": "SecondSwap_StepVesting.sol:223-232",
+      "description": "After transferring an unclaimed amount, `transferVesting` reduces `totalAmount` but recalculates the grantor's `releaseRate` as `grantorVesting.totalAmount / numOfSteps`. This ignores both the grantor's existing `amountClaimed` and `stepsClaimed`; the correct remaining rate must be based on `(totalAmount - amountClaimed) / (numOfSteps - stepsClaimed)`. Consequently, later intermediate claims can exceed the grantor's post-transfer remaining allocation.",
+      "impact": "A seller can claim more tokens than remain in their schedule. The excess is paid from the vesting contract's reserve, making other allocations under-collateralized and potentially causing buyers' final claims to revert permanently.",
+      "exploit_steps": [
+        "Use a 10-step vesting schedule with a total allocation of 1,000 tokens and a plan configuration allowing the seller to list at least 300 tokens.",
+        "At step 3, the beneficiary calls `claim()` and receives 300 tokens; their schedule has `stepsClaimed == 3` and `amountClaimed == 300`.",
+        "The beneficiary lists 300 tokens through `SecondSwap_Marketplace`. The manager invokes `transferVesting`, reducing the grantor's `totalAmount` to 700 and setting `releaseRate` to `700 / 10 == 70`.",
+        "At step 9, the beneficiary calls `claim()`. The contract calculates six claimable steps and pays `6 * 70 == 420` tokens, although only 400 tokens remain in the schedule after the earlier 300-token claim.",
+        "The beneficiary has received 720 tokens against a post-transfer schedule total of 700, leaving the vesting reserve short by 20 tokens. A buyer who later receives the listed 300-token allocation can fail to claim the full allocation because the reserve is underfunded."
+      ]
+    },
+    {
+      "title": "Referral rewards are calculated and emitted but never paid",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:478-492",
+      "description": "`_handleTransfers` computes `referralFeeCost` when a nonzero referral is supplied, but the only payment transfers are the buyer payment into the marketplace, the seller proceeds, and `buyerFeeTotal + sellerFeeTotal` to `feeCollector`. There is no transfer to `_referral` or to the configured `referralFeeCollector`. Nevertheless, `spotPurchase` emits the value as `Purchased.referralReward`; additionally, the calculation reports `buyerFeeTotal - referralShare`, which is the retained portion rather than the referral share.",
+      "impact": "Referrers receive no referral reward while the fee collector retains the entire buyer fee, and off-chain consumers of `Purchased` are misled into believing a reward was paid.",
+      "exploit_steps": [
+        "Configure a positive marketplace `referralFee` and create an active non-private listing.",
+        "A buyer calls `spotPurchase` with a distinct nonzero referral address.",
+        "Observe that the referral address's payment-token balance is unchanged after the successful purchase.",
+        "Observe that `feeCollector` receives the full `buyerFeeTotal + sellerFeeTotal`, while the event reports a nonzero `referralReward`."
+      ]
+    },
+    {
+      "title": "Unprotected VestingManager initializer enables marketplace impersonation and vesting theft",
+      "severity": "critical",
+      "location": "SecondSwap_VestingManager.sol:107-109 (initialize)",
+      "description": "The upgradeable VestingManager exposes a public initializer with no access control beyond the one-time Initializable guard. If the proxy is deployed without being initialized atomically, any attacker can become s2Admin. The attacker can then set marketplace to an attacker-controlled contract and mark arbitrary StepVesting plans as sellable. The manager trusts the configured marketplace for listVesting and completePurchase, and these functions directly move vesting allocations without payment verification.",
+      "impact": "An attacker who front-runs initialization can transfer users' vesting allocations from their schedules into the manager and immediately transfer them to an attacker-controlled address without paying. The default 20% sell limit still permits theft of up to 20% of each victim's allocation, and the attacker controls the manager configuration.",
+      "exploit_steps": [
+        "Deploy the VestingManager proxy without initialization, or otherwise leave its initializer callable.",
+        "Call initialize(attacker) from the attacker's address to set s2Admin.",
+        "Deploy or use an attacker-controlled contract and call setMarketplace(evilMarketplace).",
+        "Call setSellable(victimVestingPlan, true) as the newly assigned s2Admin.",
+        "From evilMarketplace, call listVesting(victim, victimVestingPlan, amount), where amount is within the manager's sell limit. The manager transfers the victim's allocation to itself because the vesting contract authorizes the manager.",
+        "From evilMarketplace, call completePurchase(attacker, victimVestingPlan, amount). The manager transfers the escrowed allocation to the attacker without any payment check."
+      ]
+    },
+    {
+      "title": "Final vesting claim can set stepsClaimed above the schedule length",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:167-181 (claimable) and 193-202 (claim)",
+      "description": "claimable derives currentStep as elapsedTime / stepDuration but never caps it at numOfSteps. When the schedule duration is not an exact multiple of numOfSteps and stepDuration is small enough, currentStep at endTime can exceed numOfSteps. The function returns claimableSteps = currentStep - stepsClaimed, and claim stores this excessive value in stepsClaimed.",
+      "impact": "A beneficiary can end up with stepsClaimed greater than numOfSteps. Any later vesting transfer or marketplace purchase that adds allocation to that beneficiary reverts in _createVesting because numOfSteps - stepsClaimed underflows. This permanently prevents further allocations or purchases to the affected address and can deny protocol operations for that buyer or beneficiary.",
+      "exploit_steps": [
+        "Deploy a vesting plan with startTime 100, endTime 105, and numOfSteps 3. The constructor sets stepDuration to 1.",
+        "Create a vesting allocation for a beneficiary and wait until timestamp 105 or later.",
+        "Call claim(). claimable computes currentStep as 5, so claimableSteps is 5 rather than being capped at 3; claim then stores stepsClaimed = 5.",
+        "Attempt to transfer additional vesting to the beneficiary through transferVesting, or purchase a marketplace allocation to that beneficiary.",
+        "_createVesting enters its existing-beneficiary branch and evaluates numOfSteps - stepsClaimed, i.e. 3 - 5, which reverts due to underflow."
+      ]
+    },
+    {
+      "title": "Unprotected marketplace initializer allows complete proxy takeover",
+      "severity": "high",
+      "location": "SecondSwap_Marketplace.sol:180-183 (initialize)",
+      "description": "The upgradeable marketplace initializer is publicly callable and only protected by the one-time Initializable guard. It does not restrict who may initialize the proxy or validate the supplied token and settings addresses. If the proxy is deployed without being initialized atomically, an attacker can set marketplaceSetting to an attacker-controlled settings contract and designate an attacker-controlled payment token as supported.",
+      "impact": "The attacker can impersonate the marketplace at its expected address, create listings without escrow using a malicious vesting manager, and direct buyers' payment tokens to attacker-controlled sellers or fee collectors. Legitimate users interacting with the compromised proxy can lose their payment funds.",
+      "exploit_steps": [
+        "Deploy or identify a marketplace proxy that has not yet been initialized.",
+        "Call initialize(attackerToken, attackerSettings) before the legitimate deployment transaction.",
+        "Configure attackerSettings to return the attacker as s2Admin, return a malicious vesting manager, and report that the marketplace is not frozen.",
+        "Use the malicious manager and a token implementing decimals() to create a listing through the marketplace without actually escrowing any vesting allocation.",
+        "Convince or cause a buyer to call spotPurchase on the compromised marketplace.",
+        "The marketplace transfers the buyer's payment token to the attacker-controlled listing seller and fee collector, while the malicious manager's completePurchase performs no vesting transfer."
+      ]
+    },
+    {
+      "title": "Per-purchase rounding lets buyers systematically underpay fractional purchases",
+      "severity": "medium",
+      "location": "SecondSwap_Marketplace.sol:459-471 (_handleTransfers)",
+      "description": "The payment amount is independently rounded down for every purchase with baseAmount = (_amount * discountedPrice) / 10**decimals. There is no cumulative remainder or minimum-price mechanism that preserves the aggregate price across multiple partial purchases. A buyer can split a listing into purchases whose exact prices contain fractional payment-token units, causing every purchase to discard its remainder.",
+      "impact": "A buyer can acquire the full vesting allocation for materially less than the listing's stated per-token price. The loss is borne by the seller, and the discount can be amplified by choosing a payment token with coarse decimals and repeatedly purchasing the listing's minimum-sized fraction.",
+      "exploit_steps": [
+        "Use a vesting token with 18 decimals and a supported payment token with zero decimals.",
+        "Have a seller create a PARTIAL listing for 1,000,000 vesting tokens at price 3 payment-token units per whole vesting token, with minPurchaseAmt set to 0.5 tokens.",
+        "Purchase the listing in 2,000,000 transactions of 0.5 tokens each.",
+        "Each transaction computes floor(0.5 * 3) = 1 payment unit, so the buyer pays 2,000,000 units total instead of the 3,000,000 units implied by the listed price.",
+        "The buyer receives the entire listed allocation while the seller loses 1,000,000 payment units."
+      ]
+    },
+    {
+      "title": "Manager custody merges vesting progress across unrelated sellers",
+      "severity": "medium",
+      "location": "SecondSwap_StepVesting.sol:288-304 (_createVesting), used by SecondSwap_VestingManager.sol:139, 151, and 163",
+      "description": "All allocations escrowed by the vesting manager are represented by the single beneficiary address address(this). When a transfer is added to an existing beneficiary record, _createVesting ignores the incoming _stepsClaimed value and retains the existing record's stepsClaimed. Consequently, an allocation transferred from a seller with different claim progress is merged into the manager's unrelated vesting schedule. Purchases and delistings then create beneficiary schedules using the manager's incorrect aggregate stepsClaimed.",
+      "impact": "A buyer's purchased allocation can unlock substantially earlier or later than the source seller's vesting schedule. For example, an allocation with eight of ten steps already claimed can be merged into a manager record at step zero, allowing the buyer to claim nine-tenths of that allocation at step nine instead of only the amount scheduled for the remaining two steps. This breaks vesting-time guarantees and can create material early access to vested tokens.",
+      "exploit_steps": [
+        "Create a StepVesting plan with ten steps and have beneficiary B receive and list an allocation before claiming any steps, causing the manager's address(this) record to have stepsClaimed equal to zero.",
+        "Have beneficiary A claim through step eight of the same plan, then list an unclaimed allocation from A whose transfer carries _stepsClaimed equal to eight.",
+        "The manager receives A's allocation through transferVesting, but _createVesting takes the existing manager record branch and ignores A's stepsClaimed, leaving the manager record at zero.",
+        "A buyer purchases A's listing, causing the manager to transfer the allocation to the buyer with _stepsClaimed equal to zero.",
+        "At step nine, the buyer can claim nine-tenths of the transferred amount under the manager-derived schedule, despite the source allocation having only two vesting steps remaining."
+      ]
+    },
+    {
+      "title": "Unprotected vesting deployer initializer permits takeover of the deployment proxy",
+      "severity": "medium",
+      "location": "SecondSwap_VestingDeployer.sol:77-80 (initialize)",
+      "description": "The upgradeable vesting deployer initializer is publicly callable and has no authorization or nonzero-address checks. If the proxy is deployed without atomic initialization, the first caller can set both s2Admin and manager to attacker-chosen addresses.",
+      "impact": "The attacker can permanently seize administrative control of the deployer, prevent the legitimate administrator from configuring token owners or the manager, and redirect future vesting deployments to an attacker-controlled manager. If the proxy is reused while existing vesting contracts recognize it as vestingDeployer, the attacker can also configure a token mapping and invoke the deployer's transferVesting wrapper against those plans, moving unclaimed allocations without beneficiary consent.",
+      "exploit_steps": [
+        "Deploy or identify a vesting deployer proxy that has not yet been initialized.",
+        "Call initialize(attacker, attackerManager) before the legitimate administrator.",
+        "Call setTokenOwner(token, attacker) to map the attacker's address to a token.",
+        "If an existing StepVesting plan for that token has this deployer proxy as its vestingDeployer, call transferVesting(grantor, attacker, amount, plan, id).",
+        "The deployer authorization check succeeds because _tokenOwner[attacker] matches the plan token, and the StepVesting authorization succeeds because msg.sender at the StepVesting layer is the compromised deployer proxy."
+      ]
+    },
+    {
+      "title": "Token-only authorization lets any mapped owner drain vesting plans",
+      "severity": "high",
+      "location": "SecondSwap_VestingDeployer.sol:176-181 and 218-230; SecondSwap_StepVesting.sol:216-220",
+      "description": "The deployer wrappers authorize createVesting, createVestings, and transferVesting solely by checking that _tokenOwner[msg.sender] equals the target vesting contract's token. They do not verify that the caller is the target plan's tokenIssuer or that the plan was deployed for that caller. Every plan deployed through the deployer grants the deployer contract vestingDeployer authorization, so the target StepVesting accepts the wrapper call regardless of which issuer created the plan. setTokenOwner also permits multiple owners to be mapped to the same token.",
+      "impact": "A second address mapped to the same ERC20 can transfer any user's unclaimed allocation, including allocations escrowed under the vesting manager address, to itself without approval. The attacker can subsequently claim the stolen allocation. Manager bookkeeping and marketplace listings remain unchanged, so stolen marketplace custody also causes the affected listings to revert on later purchases or delistings.",
+      "exploit_steps": [
+        "Have a victim deploy a StepVesting plan P for token T through the vesting deployer D, and list some of P's allocations so the vesting manager M holds them under beneficiary address M.",
+        "The administrator maps an attacker-controlled address A to token T with D.setTokenOwner(T, A). The contract permits this even if another issuer already manages plans for T.",
+        "A calls D.transferVesting(M, A, amount, P, transactionId), or targets any victim beneficiary instead of M.",
+        "D's token check passes because _tokenOwner[A] == T == P.token(). D then calls P.transferVesting.",
+        "P accepts the call because msg.sender is D, which is P.vestingDeployer, and transfers the allocation from M or the victim to A.",
+        "A waits until the allocation is claimable and calls P.claim(); if manager custody was targeted, the corresponding marketplace listing can no longer be fulfilled."
+      ]
+    },
+    {
+      "title": "Changing the vesting manager strands all existing marketplace escrow",
+      "severity": "medium",
+      "location": "SecondSwap_MarketplaceSetting.sol:setManager; SecondSwap_Marketplace.sol:363-367 and 534-538",
+      "description": "The settings administrator can replace `vestingManager` without migrating active marketplace allocations or coordinating the new manager's custody state. Existing listings escrow their allocations in the old manager's associated vesting-plan records, but `unlistVesting` and `spotPurchase` always query the current settings contract and call the newly configured manager. A newly deployed manager has no corresponding `address(this)` allocation, so its `transferVesting(address(this), ...)` call reverts.",
+      "impact": "Every active listing at the time of a manager rotation becomes impossible to purchase or delist, leaving the seller's vesting allocation stranded in the old manager. Recovery requires privileged restoration of the exact old manager and settings configuration.",
+      "exploit_steps": [
+        "A seller lists tokens while marketplace settings point to vesting manager A; the allocation is transferred into manager A's vesting schedule for `address(managerA)`.",
+        "The settings administrator calls `setManager(managerB)` without migrating the active listings or their custody balances.",
+        "A buyer calls `spotPurchase` for the existing listing, or the seller calls `unlistVesting`.",
+        "The marketplace calls `completePurchase` or `unlistVesting` on manager B, whose vesting schedule does not contain the escrowed allocation, and the transfer reverts."
+      ]
+    },
+    {
+      "title": "Marketplace settings accepts zero critical dependency addresses",
+      "severity": "medium",
+      "location": "SecondSwap_MarketplaceSetting.sol:131-150",
+      "description": "The constructor validates `_feeCollector` and `_s2Admin` but does not validate `_whitelistDeployer`, `_vestingManager`, or `_usdt`. These values are immediately used by marketplace money-moving and custody paths. In particular, there is no setter for `usdt`, so a zero `_usdt` permanently leaves the deployment unable to process early-delisting penalties.",
+      "impact": "A settings deployment with a zero vesting manager makes listing and purchase flows revert. A zero whitelist deployer makes all private listings revert. A zero USDT address makes every seller's early unlisting before `minListingDuration` revert, locking escrowed allocations until the duration expires.",
+      "exploit_steps": [
+        "Deploy `SecondSwap_MarketplaceSetting` with `_usdt = address(0)` (or `_vestingManager = address(0)` / `_whitelistDeployer = address(0)`).",
+        "Configure the marketplace to use this settings contract and create an active listing when the vesting manager is valid, or attempt a listing with the zero vesting manager/whitelist deployer.",
+        "For the zero-USDT case, the seller calls `unlistVesting` before the minimum listing duration elapses.",
+        "The marketplace calls `balanceOf` and `safeTransferFrom` on the zero USDT address, causing the transaction to revert and preventing early recovery of the escrowed vesting allocation."
+      ]
+    }
+  ]
+}
